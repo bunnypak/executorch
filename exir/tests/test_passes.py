@@ -33,6 +33,7 @@ from executorch.exir.passes import (
 )
 from executorch.exir.passes.constant_prop_pass import constant_prop_pass
 from executorch.exir.passes.debug_handle_generator_pass import DebugHandleGeneratorPass
+from executorch.exir.passes.fuse_dq_q_pass import FuseDQandQPass
 from executorch.exir.passes.insert_write_back_for_buffers_pass import (
     insert_write_back_for_buffers_pass,
 )
@@ -50,6 +51,12 @@ from executorch.exir.tests.models import MLP, Mul
 from functorch.experimental import control_flow
 
 from torch import nn
+
+from torch.ao.quantization.quantize_pt2e import convert_pt2e, prepare_pt2e
+from torch.ao.quantization.quantizer.xnnpack_quantizer import (
+    get_symmetric_quantization_config,
+    XNNPACKQuantizer,
+)
 from torch.export import export
 from torch.fx import GraphModule, subgraph_rewriter
 from torch.fx.experimental.proxy_tensor import make_fx
@@ -1244,3 +1251,45 @@ class TestPasses(unittest.TestCase):
         #     %copy__default : [num_users=1] = call_function[target=torch.ops.aten.copy_.default](args = (%arg0_1, %aten_add_tensor_1), kwargs = {})
         #     return (copy__default, aten_add_tensor)
         self.assertEqual(count_copies(gm), 1)
+
+    def test_dq_q_fusion_pass(self) -> None:
+        class TestLinearAdd(torch.nn.Module):
+            def __init__(self):
+                super().__init__()
+                self.linear1 = torch.nn.Linear(8, 16)
+
+            def forward(self, x):
+                x1 = self.linear1(x)
+                x1 = x1 + x1
+                return x1
+
+        example_inputs = (torch.randn(9, 8),)
+        model = TestLinearAdd()
+        m_eager = model.eval()
+
+        # program capture
+        m = torch._export.capture_pre_autograd_graph(
+            m_eager,
+            example_inputs,
+        )
+
+        quantizer = XNNPACKQuantizer()
+        quantization_config = get_symmetric_quantization_config()
+        quantizer.set_global(quantization_config)
+        m = prepare_pt2e(m, quantizer)
+        m = convert_pt2e(m, fold_quantize=True)
+        ep = torch.export.export(m, example_inputs)
+
+        edge = to_edge(ep, compile_config=EdgeCompileConfig(_check_ir_validity=False))
+        for node in edge.exported_program().graph_module.graph.nodes:
+            # Remove add node so that we can test the transform pass which should
+            # remove the dq and q nodes.
+            if "add" in node.name:
+                node.replace_all_uses_with(node.args[0])
+        edge.exported_program().graph_module.graph.eliminate_dead_code()
+
+        len_pre_transform = len(edge.exported_program().graph_module.graph.nodes)
+        edge.transform([FuseDQandQPass()])
+        len_post_transform = len(edge.exported_program().graph_module.graph.nodes)
+        # As one dq and one q node are removed, the number of nodes should be reduced by 2.
+        self.assertEqual(len_pre_transform - len_post_transform, 2)
